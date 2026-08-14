@@ -350,6 +350,12 @@ namespace TensileLite
                 bool needSwizzle = problem.swizzleTensorA() || problem.swizzleTensorB();
                 bool needMXSwizzle = (problem.mxBlockA() != 0) || (problem.mxBlockB() != 0);
 
+                // An MX problem never reaches the cached path otherwise: each problem
+                // regenerates and re-uploads scales identical to the block already on
+                // the GPU, which costs more than the benchmark it precedes.
+                if(needMXSwizzle && !m_problemDependentData && m_mxBlockReady)
+                    needMXSwizzle = false;
+
                 if(m_keepPristineCopyOnGPU && !m_problemDependentData)
                 {
                     // use gpu pristine
@@ -377,13 +383,27 @@ namespace TensileLite
                 }
                 else
                 {
+                    // mxDataGenerator still has to run: a scale means nothing apart
+                    // from the data it was generated with, and the swizzled copy has
+                    // to reach the GPU.  This is where the shared block is made, once,
+                    // for the largest problem of the run rather than for this one --
+                    // whatever order the problems come in, none of them outgrows it.
+                    bool const mxBootstrap = needMXSwizzle && !m_problemDependentData;
+                    ContractionProblemGemm const& mxProblem
+                        = (mxBootstrap && m_mxLargestProblem != nullptr) ? *m_mxLargestProblem
+                                                                        : problem;
+
                     // Update CPU Inputs if prepareGPUInputs is not called.
-                    if(m_cpuPtrs.empty() && m_problemDependentData)
-                        initializeCPUInputs(problem);
-                    if(m_problemDependentData)
-                        copyValidToGPUBuffer(problem);
+                    if((m_cpuPtrs.empty() && m_problemDependentData) || mxBootstrap)
+                        initializeCPUInputs(mxProblem);
+                    if(m_problemDependentData || mxBootstrap)
+                        copyValidToGPUBuffer(mxProblem);
                     if(needSwizzle || needMXSwizzle)
-                        copySwizzledToGPUBuffer(problem);
+                    {
+                        copySwizzledToGPUBuffer(mxProblem);
+                        if(needMXSwizzle)
+                            m_mxBlockReady = true;
+                    }
 
                     // gpu to gpu
                     copyInputs(m_gpuPtrs,
@@ -901,8 +921,12 @@ namespace TensileLite
             virtual void preSolution(ContractionSolution* const solution) override
             {
                 m_currentSolution = solution;
-                // Re-init MX inputs for solution-dependent HostPreSwizzle.
-                if(m_currentSolution != nullptr
+                // Re-init MX inputs for solution-dependent HostPreSwizzle.  Generating
+                // them again is most of what a solution costs outside the kernel, and
+                // the layout it picks is only observable through the reference, so a
+                // benchmark run keeps whatever the first solution put there.
+                if(m_elementsToValidate
+                   && m_currentSolution != nullptr
                    && m_currentGemmProblem != nullptr
                    && !m_gpuPtrs.empty()
                    && needsSolutionDependentMXPreswizzle(*m_currentGemmProblem,
@@ -1181,6 +1205,11 @@ namespace TensileLite
             // hand back gpuInput.valid as-is rather than re-swizzling).
             bool m_mxPreswizzledA = false;
             bool m_mxPreswizzledB = false;
+            // The largest MX problem of the run, which the one shared block of data
+            // and scales is generated for, and whether that has happened yet.
+            ContractionProblemGemm const* m_mxLargestProblem  = nullptr;
+            size_t                        m_mxLargestElements = 0;
+            bool                          m_mxBlockReady      = false;
         };
 
         template <>

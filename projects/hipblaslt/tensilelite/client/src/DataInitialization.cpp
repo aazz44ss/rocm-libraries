@@ -1095,6 +1095,21 @@ namespace TensileLite
                     for(size_t i = 0; i < problem.batchIndices().size(); i++)
                         numOfBatch *= problem.batchSize(i);
                     m_maxBatch = std::max(m_maxBatch, numOfBatch);
+
+                    // The MX block every problem and solution will share is generated
+                    // for the largest of them, which is known here: the buffers are
+                    // sized for it anyway, and a run whose problems grow would
+                    // otherwise regenerate the block as it went.
+                    if(problem.mxBlockA() != 0 || problem.mxBlockB() != 0)
+                    {
+                        size_t const elements = problem.a().totalAllocatedElements()
+                                                + problem.b().totalAllocatedElements();
+                        if(m_mxLargestProblem == nullptr || elements > m_mxLargestElements)
+                        {
+                            m_mxLargestProblem  = ptr;
+                            m_mxLargestElements = elements;
+                        }
+                    }
                 }
                 else if(auto ptr = dynamic_cast<ContractionProblemGroupedGemm const*>(p.get()))
                 {
@@ -1386,11 +1401,16 @@ namespace TensileLite
                 |= (m_sparse
                     | (args["bias-type-args"].as<std::vector<rocisa::DataType>>().size() > 1));
 
-            // Force problem-dependent initialization for MX FP4 to enable mxDataGenerator
-            if(args.count("mx-a-block") && args["mx-a-block"].as<int>() > 0)
-                m_problemDependentData = true;
-            if(args.count("mx-b-block") && args["mx-b-block"].as<int>() > 0)
-                m_problemDependentData = true;
+            // mxDataGenerator is what keeps MX data and its scales consistent, which
+            // only a reference comparison can tell apart, and it runs per problem.
+            // Without validation every solution shares one initialization instead.
+            if(m_elementsToValidate)
+            {
+                if(args.count("mx-a-block") && args["mx-a-block"].as<int>() > 0)
+                    m_problemDependentData = true;
+                if(args.count("mx-b-block") && args["mx-b-block"].as<int>() > 0)
+                    m_problemDependentData = true;
+            }
 
             allocNewCPUInputs();
             allocNewGPUInputs();
