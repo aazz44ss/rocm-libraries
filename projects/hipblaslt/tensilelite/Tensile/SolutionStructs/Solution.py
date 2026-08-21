@@ -3390,6 +3390,18 @@ class Solution(collections.abc.Mapping):
       else:
         state["_staggerStrideShift"] = (int)(math.ceil(math.log(state["StaggerUStride"] / (state["DepthU"] * bpeAB), 2)))
 
+      def fp32LdsReadDwords(tc: str) -> int:
+        """Dwords one lane takes per FP32 local read, for the bank-conflict model.
+
+        WMMA_V3 reads the whole VW-wide vector with a single ds_load (b64/b128),
+        so it covers VW banks per lane; XF32 emulation still reads one at a time.
+        Both LdsPad and LdsBlockSizePerPad must pass the same value or they come
+        from different configs and no longer pair up.
+        """
+        if state.get("UseF32XEmulation", False):
+          return 1
+        return min(state[f"VectorWidth{tc}"], 4)
+
       def calcLdsPad(isaInfoMap: Dict[str, IsaInfo]) -> Tuple[int, int, int, int, int]:
         # SubtileImpl: LDS padding is disabled.
         # gfx950 subtile uses software swizzle+rotation for bank conflict avoidance instead.
@@ -3472,7 +3484,8 @@ class Solution(collections.abc.Mapping):
                               vw, state[f"LocalReadVectorWidth{tc}"], miwg,
                               miInputPerThread=state["MIInputPerThread"],
                               miWaveTile=miwt,
-                              xf32EmuPack=state.get("UseF32XEmulation", False))
+                              xf32EmuPack=state.get("UseF32XEmulation", False),
+                              readDwords=fp32LdsReadDwords(tc))
               if state[f"DirectToLds{tc}"]:
                 # TODO: Check if there are cases which benefit from padding, currently set to zero by default
                 ldsPad = state["MatrixInstM"] if ldstr else 0
@@ -3696,7 +3709,8 @@ class Solution(collections.abc.Mapping):
                                             state[f"VectorWidth{tc}"], lrvw, miwg,
                                             miInputPerThread=state["MIInputPerThread"],
                                             miWaveTile=miwt,
-                                            xf32EmuPack=state.get("UseF32XEmulation", False))
+                                            xf32EmuPack=state.get("UseF32XEmulation", False),
+                                            readDwords=fp32LdsReadDwords(tc))
               else:
                 LdsBlockSizePerPad = 0
           else:

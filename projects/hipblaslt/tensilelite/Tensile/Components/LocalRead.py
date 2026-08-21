@@ -279,7 +279,9 @@ class LocalReadMFMA(LocalRead):
     def _genDsReadConvTable(miInputPerThread, lrvwTile):
         halfM = miInputPerThread // 2
         numRows = lrvwTile
-        colsPerRow = halfM // lrvwTile
+        # When lrvwTile > halfM (small MatrixInstK / MIInputPerThread), still emit one
+        # column so the native FP32 wide ds_load (lrvwTile=4) has a valid remap table.
+        colsPerRow = max(halfM // lrvwTile, 1)
         table = []
         for group in range(2):
             for col in range(colsPerRow):
@@ -829,6 +831,10 @@ class LocalReadMFMA(LocalRead):
             useTransposeCode = writer.states.a.useTransposeCodeThis if tc == "A" else writer.states.b.useTransposeCodeThis
             useDirect32XEmulation = writer.states.a.useDirect32XEmulationThis if tc == "A" else writer.states.b.useDirect32XEmulationThis
         indexTranpose = lrvwTile > 1 and (not useTransposeCode)
+        wideF32LayoutRemap = (lrvwTile > 1 and not kernel["UseF32XEmulation"]
+                              and kernel["ProblemType"][MacDataType].isSingle()
+                              and writer.states.asmCaps.get("HasWMMA_V3", False)
+                              and not kernel["UnrollMajorLDS%s"%tc] and not tP["isM"])
 
         numSplitMetadata = max(ceil((blockWidth * 4) // tP["bpeDS"]) - 1, 0) if tP["isM"] else 0
 
@@ -1077,7 +1083,7 @@ class LocalReadMFMA(LocalRead):
                     valuiIdx = int(valufIdx)
                     baseValuiIdx = valuiIdx
                     localReadCode = imod.add(Module("LocalRead%s Valu%u"%(tc,valuiIdx)))
-                    if needPack or numSplitMetadata:
+                    if needPack or numSplitMetadata or wideF32LayoutRemap:
                         packCode = pack.add(Module("packCode"))
                         packCodePre = packPre.add(Module("packCodePre"))
 
@@ -1086,6 +1092,7 @@ class LocalReadMFMA(LocalRead):
                     multiGroupXF32 = kernel["UseF32XEmulation"] and is_wmma_v3 and numVgpr * numReadsPerUnroll > 8
                     outerBaseValuiIdx = baseValuiIdx
                     for tiIdx in range(0, numTilePerInst):
+                        readGroupStart = int(valufIdx)
                         for rIdx in range(0, numReadsPerUnroll):
                             valuiIdx = int(valufIdx)
                             baseValuiIdx = valuiIdx - (valuiIdx%8) # use multiple of 8
@@ -1102,7 +1109,7 @@ class LocalReadMFMA(LocalRead):
                             packCodePreT = Module() # Allocate temporary module for pack code Pre
                             localReadCodeT = Module()
 
-                            if needPack or numSplitMetadata:
+                            if needPack or numSplitMetadata or wideF32LayoutRemap:
                                 if kernel["UseF32XEmulation"]:
                                     # Pack data 0-7 with layout:
                                     # Val+0: bf16 high (0,1)
@@ -1552,6 +1559,20 @@ class LocalReadMFMA(LocalRead):
                                                                             comment="select K=%u%u for vector=%u"%(elementIdx*4+2,  elementIdx*4+3, vectorIdx)))
                                                         packCodeT.add(VLShiftLeftOrB32(dst=vgpr("Valu%s_X%u_I%u+%u"%(tc, bufferIdx, iui, vgprIdx + vgprOffset)), src0=vgpr("PackTemp"), shiftHex=16, src1=vgpr("Valu%s_X%u_I%u+%u"%(tc, bufferIdx, iui, vgprIdx + vgprOffset)), comment="pack two half Vgpr to one Vgpr"))
                                                         vgprOffset += 1
+                                        if wideF32LayoutRemap:
+                                            # the wide ds_load stores [MiInputPerThread][vector], wmma reads
+                                            # [vector][MiInputPerThread], so transpose the group in place
+                                            for vectorIdx in range(0, numVgpr):
+                                                for elementIdx in range(0, numReadsPerUnroll):
+                                                    dstIdx = vectorIdx * numReadsPerUnroll + elementIdx
+                                                    srcIdx = elementIdx * numVgpr + vectorIdx
+                                                    # an earlier swap may have moved it, follow it to where it is now
+                                                    while srcIdx < dstIdx:
+                                                        srcIdx = (srcIdx % numReadsPerUnroll) * numVgpr + srcIdx // numReadsPerUnroll
+                                                    if srcIdx == dstIdx:
+                                                        continue
+                                                    packCodeT.add(VSwapB32(dst=vgpr("Valu%s_X%u_I%u+%u"%(tc, bufferIdx, iui, readGroupStart+dstIdx)), src=vgpr("Valu%s_X%u_I%u+%u"%(tc, bufferIdx, iui, readGroupStart+srcIdx)), \
+                                                                        comment="select K=%u for vector=%u"%(elementIdx, vectorIdx)))
 
                                 else:
                                     isHigh8Bits  = (blockWidth == 0.25) and ( ((rIdx % 4) % 2) == 1) # 1,3
@@ -1732,6 +1753,10 @@ class LocalReadMFMA(LocalRead):
                                             or kernel["ProblemType"][MacDataType].isHalf() or kernel["ProblemType"][MacDataType].isFloat4() \
                                                 or kernel["ProblemType"][MacDataType].is6bitFloat() or kernel["ProblemType"][MacDataType].isInt8()):
                                     offset_val = calcGfx1250LdsOffset()
+                                elif tuple(kernel["ISA"][:2]) == (12, 5) \
+                                        and kernel["ProblemType"][MacDataType].isSingle() \
+                                        and lrvwTile > 1:
+                                    offset_val = calcGfx1250LdsOffset()
                                 else:
                                     offset_val = int((rIdx * numElementPerRead * UnrollStride + offset_val + tP["localReadOffset"]) * tP["bpeDS"])
 
@@ -1831,7 +1856,7 @@ class LocalReadMFMA(LocalRead):
                                 addPackLR = True
 
                             if addPackLR:
-                                if needPack or numSplitMetadata:
+                                if needPack or numSplitMetadata or wideF32LayoutRemap:
                                     packCode.add(packCodeT)
                                     packCodePre.add(packCodePreT)
                                 localReadCode.add(localReadCodeT)

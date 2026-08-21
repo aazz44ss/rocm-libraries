@@ -7269,18 +7269,27 @@ class KernelWriter(metaclass=abc.ABCMeta):
     #   - CMS kernels: schedules are designed with lrvwTile > 1 and manage pack-code placement explicitly
     #   - WMMA_V3 XF32 emulation (gfx1250): local reads swap vgprs after read and the scheduler
     #     drains dependent local reads before the pack code, so lrvwTile > 1 is supported
+    #   - WMMA_V3 native FP32: lrvwTile=VW wide ds_load + post-read layout transpose
     isCMS = kernel["UseCustomMainLoopSchedule"]
     isMfmaXf32 = kernel["UseMFMAF32XEmulation"]
+    isWmmaV3NativeF32A = (self.states.asmCaps["HasWMMA_V3"] and
+                          kernel["ProblemType"]["MacDataTypeA"].isSingle() and
+                          not kernel["UseF32XEmulation"])
+    isWmmaV3NativeF32B = (self.states.asmCaps["HasWMMA_V3"] and
+                          kernel["ProblemType"]["MacDataTypeB"].isSingle() and
+                          not kernel["UseF32XEmulation"])
     forceLrvwTile1A = kernel["ProblemType"]["MacDataTypeA"].numBytes() >= 4 and \
       (kernel["EnableMatrixInstruction"] and kernel["MIInputPerThread"] > 1) and \
-      not (kernel["UseF32XEmulation"] and (isMfmaXf32 or isCMS or self.states.asmCaps["HasWMMA_V3"]))
+      not (kernel["UseF32XEmulation"] and (isMfmaXf32 or isCMS or self.states.asmCaps["HasWMMA_V3"])) and \
+      not isWmmaV3NativeF32A
     if not kernel["UnrollMajorLDSA"] and not forceLrvwTile1A:
       self.states.lrvwTileA = kernel["VectorWidthA"]
     else:
       self.states.lrvwTileA = 1
     forceLrvwTile1B = kernel["ProblemType"]["MacDataTypeB"].numBytes() >= 4 and \
       (kernel["EnableMatrixInstruction"] and kernel["MIInputPerThreadB"] > 1) and \
-      not (kernel["UseF32XEmulation"] and (isMfmaXf32 or isCMS or self.states.asmCaps["HasWMMA_V3"]))
+      not (kernel["UseF32XEmulation"] and (isMfmaXf32 or isCMS or self.states.asmCaps["HasWMMA_V3"])) and \
+      not isWmmaV3NativeF32B
     if not kernel["UnrollMajorLDSB"] and not forceLrvwTile1B:
       self.states.lrvwTileB = kernel["VectorWidthB"]
     else:

@@ -31,7 +31,8 @@ per data type:
   FP4  -- ds_load_tr4_b64   (64-bit, 2 banks/thread)
   FP8  -- ds_load_tr8_b64   (64-bit, 2 banks/thread)
   FP16 -- ds_load_tr16_b128 (128-bit, 4 banks/thread)
-  FP32 -- ds_load_b32        (32-bit, 1 bank/thread)
+  FP32 -- ds_load_b32        (32-bit, 1 bank/thread), or b64/b128 when
+          WMMA_V3 takes the whole VW-wide vector in one read (see readDwords)
 
 Public API (see each `def` for the full signature):
   get_fp4_mt_config      -- FP4            ds_load_tr4_b64   padding
@@ -44,6 +45,7 @@ Public API (see each `def` for the full signature):
   key is one of "perBlock", "pad", "shift" (FP4/FP8 only for "shift").
 """
 
+from collections import Counter
 from functools import lru_cache
 from typing import Dict
 
@@ -338,19 +340,26 @@ def get_fp16_mt_config(mt: int, key: str, miWaveGroup: int,
 
 # -- FP32 b32 padding ------------------------------------------------
 
-def _b32_check(rawAddrs, B, P, wOffsets, instOffs=(0,)):
-  """True if (B, P) gives 32 distinct banks for every (wOff, instOff)
-  combination."""
+def _b32_check(rawAddrs, B, P, wOffsets, instOffs=(0,), readDwords=1):
+  """True if (B, P) spreads every (wOff, instOff) evenly over the 64 banks.
+
+  readDwords is how many consecutive dwords one lane takes per instruction:
+  1 for ds_load_b32, lrvwTile for the wide ds_load_b64/b128 used by native
+  FP32 on WMMA_V3. A wide read of w dwords by 32 lanes covers 32*w banks, so
+  the best achievable is 32*w/64 hits per bank rather than one.
+  """
   def pad(x): return x + (x // B) * P if B else x
   offs = instOffs if instOffs else (0,)
+  ideal = max(1, len(rawAddrs) * readDwords // 64)
   for wOff in wOffsets:
     for io in offs:
-      padded = [pad(a + wOff + io) for a in rawAddrs]
-      if len({(p // 4) % 64 for p in padded}) != 32:
+      hits = Counter((pad(a + wOff + io) // 4 + d) % 64
+                     for a in rawAddrs for d in range(readDwords))
+      if max(hits.values()) != ideal:
         return False
   return True
 
-def _b32_search_padding(mt: int, rawAddrs: list, wOffsets, instOffs=(0,)):
+def _b32_search_padding(mt: int, rawAddrs: list, wOffsets, instOffs=(0,), readDwords=1):
   """Lowest-overhead (B, P) that passes _b32_check across all (wOff, instOff)."""
   mtBytes = mt * 4
   validB = sorted([b for b in _TDM_VALID_BLOCK_BYTES
@@ -358,7 +367,7 @@ def _b32_search_padding(mt: int, rawAddrs: list, wOffsets, instOffs=(0,)):
   best = None
   for B in validB:
     for padDw in range(1, _TDM_MAX_PAD_BYTES // 4 + 1):
-      if _b32_check(rawAddrs, B, padDw * 4, wOffsets, instOffs):
+      if _b32_check(rawAddrs, B, padDw * 4, wOffsets, instOffs, readDwords):
         overhead = (padDw * 4) / B
         if best is None or overhead < best[0]:
           best = (overhead, B, padDw)
@@ -369,11 +378,13 @@ def _build_fp32_instOffs(mt: int, vw: int, lrvw: int,
                          miInputPerThread: int, miWaveTile: int,
                          miWaveGroup: int,
                          xf32EmuPack: bool,
-                         matrixInstM: int = 16) -> tuple:
-  # Mirror LocalRead.py FP32 / XF32 ds_load_b32 emit
+                         matrixInstM: int = 16,
+                         readDwords: int = 1) -> tuple:
+  # Mirror LocalRead.py FP32 / XF32 local read emit. readDwords elements of the
+  # vector travel in one wide ds_load, so they no longer get their own offset.
   nRPU = miInputPerThread // lrvw
   numVectorsPerTile = max(miWaveTile // vw, 1)
-  numReadsPerVector = max(vw, 1)
+  numReadsPerVector = max(vw // readDwords, 1)
   miWaveGroupShape  = matrixInstM * miWaveGroup * vw
   unrollStrideBytes = mt * 4
   if xf32EmuPack:
@@ -381,7 +392,7 @@ def _build_fp32_instOffs(mt: int, vw: int, lrvw: int,
   else:
     kFn = lambda r: r * lrvw * unrollStrideBytes
   return tuple(sorted({
-    kFn(r) + v * miWaveGroupShape * 4 + e * 4
+    kFn(r) + v * miWaveGroupShape * 4 + e * readDwords * 4
     for v in range(numVectorsPerTile)
     for e in range(numReadsPerVector)
     for r in range(nRPU)
@@ -393,25 +404,30 @@ def _compute_fp32_config(mt: int, vw: int, lrvw: int,
                          miInputPerThread: int,
                          miWaveTile: int,
                          xf32EmuPack: bool = False,
-                         matrixInstM: int = 16) -> Dict[str, int]:
+                         matrixInstM: int = 16,
+                         readDwords: int = 1) -> Dict[str, int]:
   rawAddrs = [(t % 16 * vw + t // 16 * mt * lrvw) * 4 for t in range(32)]
   wOffsets = tuple(w * matrixInstM * vw * 4 for w in range(max(miWaveGroup, 1)))
   instOffs = _build_fp32_instOffs(mt, vw, lrvw, miInputPerThread, miWaveTile,
-                                  miWaveGroup, xf32EmuPack)
-  if _b32_check(rawAddrs, B=0, P=0, wOffsets=wOffsets, instOffs=instOffs):
+                                  miWaveGroup, xf32EmuPack, readDwords=readDwords)
+  if _b32_check(rawAddrs, B=0, P=0, wOffsets=wOffsets, instOffs=instOffs,
+                readDwords=readDwords):
     return {"perBlock": 0, "pad": 0}
-  cfg = _b32_search_padding(mt, rawAddrs, wOffsets, instOffs=instOffs)
+  cfg = _b32_search_padding(mt, rawAddrs, wOffsets, instOffs=instOffs,
+                            readDwords=readDwords)
   return cfg if cfg else {"perBlock": 0, "pad": 0}
 
 def get_fp32_mt_config(mt: int, key: str, vw: int, lrvw: int,
                        miWaveGroup: int,
                        miInputPerThread: int,
                        miWaveTile: int,
-                       xf32EmuPack: bool = False) -> int:
+                       xf32EmuPack: bool = False,
+                       readDwords: int = 1) -> int:
   return _compute_fp32_config(mt, vw, lrvw, miWaveGroup,
                               miInputPerThread=miInputPerThread,
                               miWaveTile=miWaveTile,
-                              xf32EmuPack=xf32EmuPack)[key]
+                              xf32EmuPack=xf32EmuPack,
+                              readDwords=readDwords)[key]
 
 @lru_cache(maxsize=None)
 def _compute_mxs_config(matrixInstK: int, mxBlock: int, vw: int) -> Dict[str, int]:
